@@ -36,7 +36,15 @@ type Device interface {
 	// (technically a HID report with type 'feature' is send to the device)
 	WriteFeature([]byte) error
 	// Preform an interrupt transfer to the device
-	WriteInterrupt(byte, []byte) (int, error)
+	WriteInterrupt(byte, []byte) (int, error)	// ReadCh returns a channel that will be sent input reports from the device.
+
+	// If the device uses numbered reports, the first byte will be the report
+	// number.
+	ReadCh() <-chan []byte
+
+	// ReadError returns the read error, if any after the channel returned from
+	// ReadCh has been closed.
+	ReadError() error
 }
 
 // FindDevices iterates through all devices with a given vendor and product id

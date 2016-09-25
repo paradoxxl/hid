@@ -17,11 +17,18 @@ import (
 	"errors"
 	"syscall"
 	"unsafe"
+	"fmt"
+	"sync"
 )
 
 type winDevice struct {
 	handle syscall.Handle
 	info   *DeviceInfo
+
+	readSetup sync.Once
+	readCh    chan []byte
+	readErr   error
+	readOl    *syscall.Overlapped
 }
 
 // returns the casted handle of the device
@@ -103,12 +110,14 @@ func getCString(fnCall callCFn) string {
 
 func openDevice(info *DeviceInfo, enumerate bool) (*winDevice, error) {
 	access := uint32(syscall.GENERIC_WRITE | syscall.GENERIC_READ)
-	shareMode := uint32(syscall.FILE_SHARE_READ)
+	//shareMode := uint32(syscall.FILE_SHARE_READ)
+	shareMode := uint32(syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE)
 	if enumerate {
 		// if we just need a handle to get the device properties
 		// we should not claim exclusive access on the device
 		access = 0
 		shareMode = uint32(syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE)
+
 	}
 	pPtr, err := syscall.UTF16PtrFromString(info.Path)
 	if err != nil {
@@ -117,11 +126,21 @@ func openDevice(info *DeviceInfo, enumerate bool) (*winDevice, error) {
 
 	hFile, err := syscall.CreateFile(pPtr, access, shareMode, nil, syscall.OPEN_EXISTING, syscall.FILE_FLAG_OVERLAPPED, 0)
 	if err != nil {
+		fmt.Printf("Cannot open hiddevice %v\n",*pPtr)
 		return nil, err
 	} else {
-		return &winDevice{handle: hFile, info: info}, nil
+		return &winDevice{
+			handle: hFile,
+			info: info,
+			readOl: &syscall.Overlapped{
+				HEvent: syscall.Handle(C.CreateEvent(nil, C.FALSE, C.FALSE, nil)),
+			},
+		}, nil
 	}
 }
+
+//readOl: &syscall.Overlapped{
+//HEvent: syscall.Handle(C.CreateEvent(nil, C.FALSE, C.FALSE, nil)),
 
 func getDeviceDetails(deviceInfoSet C.HDEVINFO, deviceInterfaceData *C.SP_DEVICE_INTERFACE_DATA) *DeviceInfo {
 	devicePath := getCString(func(buffer unsafe.Pointer, size *C.DWORD) unsafe.Pointer {
@@ -261,4 +280,68 @@ func (di *DeviceInfo) Open() (Device, error) {
 		}
 		return nil, err
 	}
+}
+
+
+func (d *winDevice) ReadCh() <-chan []byte {
+	d.readSetup.Do(func() {
+		d.readCh = make(chan []byte, 30)
+		go d.readThread()
+	})
+	return d.readCh
+}
+func (d *winDevice) ReadError() error {
+	return d.readErr
+}
+
+func (d *winDevice) readThread() {
+	defer close(d.readCh)
+
+	for {
+		buf := make([]byte, d.info.InputReportLength+1)
+		C.ResetEvent(C.HANDLE(unsafe.Pointer(d.readOl.HEvent)))
+
+		if err := syscall.ReadFile(d.handle, buf, nil, d.readOl); err != nil {
+			if err != syscall.ERROR_IO_PENDING {
+				if d.readErr == nil {
+					d.readErr = err
+				}
+				return
+			}
+		}
+
+		// Wait for the read to finish
+		res := C.WaitForSingleObject(C.HANDLE(unsafe.Pointer(d.readOl.HEvent)), C.INFINITE)
+		if res != C.WAIT_OBJECT_0 {
+			if d.readErr == nil {
+				d.readErr = fmt.Errorf("hid: unexpected read wait state %d", res)
+			}
+			return
+		}
+
+		var n C.DWORD
+		if r := C.GetOverlappedResult(d.h(), (*C.OVERLAPPED)((unsafe.Pointer)(d.readOl)), &n, C.TRUE); r == 0 {
+			if d.readErr == nil {
+				d.readErr = fmt.Errorf("hid: unexpected read result state %d", r)
+			}
+			return
+		}
+		if n == 0 {
+			if d.readErr == nil {
+				d.readErr = errors.New("hid: zero byte read")
+			}
+			return
+		}
+
+		if buf[0] == 0 {
+			// Report numbers are not being used, so remove zero to match other platforms
+			buf = buf[1:]
+		}
+
+		select {
+		case d.readCh <- buf[:int(n-1)]:
+		default:
+		}
+	}
+
 }
